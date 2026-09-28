@@ -65,6 +65,8 @@ void BLEClientBase::loop() {
     this->disable_loop();
   } else if (this->state() == espbt::ClientState::DISCONNECTING &&
              (millis() - this->disconnecting_started_) > DISCONNECTING_TIMEOUT) {
+    if (!this->recover_disconnect_())
+      return;
     ESP_LOGE(TAG, "[%d] [%s] Timeout waiting for CLOSE_EVT after disconnect, forcing IDLE", this->connection_index_,
              this->address_str_);
     // release_services() must be called before set_idle_() — if we entered DISCONNECTING
@@ -74,6 +76,32 @@ void BLEClientBase::loop() {
     this->set_idle_();
     this->on_disconnect_complete(ESP_GATT_CONN_TIMEOUT);
   }
+}
+
+bool BLEClientBase::recover_disconnect_() {
+  // CLOSE_EVT can be lost while the controller still owns the physical link.
+  // Do not forget the peer or advertise a free slot until DISCONNECT_EVT proves
+  // that link is down. Only the timed-out peer is affected, never the whole stack.
+  if (this->disconnect_seen_)
+    return true;
+  if (!this->gap_disconnect_requested_) {
+    this->gap_disconnect_requested_ = true;
+    this->disconnecting_started_ = millis();
+    ESP_LOGW(TAG, "[%d] [%s] Teardown timed out, requesting physical disconnect", this->connection_index_,
+             this->address_str_);
+    auto err = esp_ble_gap_disconnect(this->remote_bda_);
+    if (err != ESP_OK)
+      this->log_gattc_warning_("esp_ble_gap_disconnect", err);
+  } else if (!this->disconnect_recovery_failed_) {
+    this->disconnect_recovery_failed_ = true;
+    // Keep the slot reserved, but leave the transient state so an unresponsive
+    // peer cannot prevent the tracker from restarting scans for other devices.
+    // CONNECTED is not ESTABLISHED, so GATT operations remain rejected.
+    this->set_state(espbt::ClientState::CONNECTED);
+    ESP_LOGE(TAG, "[%d] [%s] Physical disconnect unconfirmed, retaining slot", this->connection_index_,
+             this->address_str_);
+  }
+  return false;
 }
 
 float BLEClientBase::get_setup_priority() const { return setup_priority::AFTER_BLUETOOTH; }
@@ -148,6 +176,8 @@ void BLEClientBase::connect() {
 esp_err_t BLEClientBase::pair() { return esp_ble_set_encryption(this->remote_bda_, ESP_BLE_SEC_ENCRYPT); }
 
 void BLEClientBase::disconnect() {
+  if (this->disconnect_recovery_failed_)
+    return;  // Await a real disconnect event; do not retry every proxy loop tick.
   if (this->state() == espbt::ClientState::IDLE || this->state() == espbt::ClientState::DISCONNECTING) {
     ESP_LOGI(TAG, "[%d] [%s] Disconnect requested, but already %s", this->connection_index_, this->address_str_,
              espbt::client_state_to_string(this->state()));
@@ -387,6 +417,7 @@ bool BLEClientBase::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
         this->log_event_("DISCONNECT_EVT after CLOSE_EVT, already IDLE");
         break;
       }
+      this->disconnect_seen_ = true;
       // For passive disconnects (remote device disconnected or link lost),
       // DISCONNECT_EVT arrives first. Don't transition to IDLE yet — wait for
       // CLOSE_EVT to ensure the controller has fully freed resources (L2CAP
@@ -417,6 +448,9 @@ bool BLEClientBase::gattc_event_handler(esp_gattc_cb_event_t event, esp_gatt_if_
       if (this->conn_id_ != param->close.conn_id)
         return false;
       this->log_gattc_lifecycle_event_("CLOSE");
+      // During recovery a GATT close alone does not confirm physical teardown.
+      if (this->gap_disconnect_requested_ && !this->disconnect_seen_)
+        break;
       this->release_services();
       this->set_idle_();
       this->on_disconnect_complete(param->close.reason);

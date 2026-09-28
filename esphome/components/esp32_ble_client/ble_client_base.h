@@ -127,7 +127,9 @@ class BLEClientBase : public espbt::ESPBTClient, public Component {
   uint8_t service_count_{0};  // ESP32 has max handles < 255, typical devices have < 50 services
   bool auto_connect_{false};
   bool paired_{false};
-  // 6 bytes used, 2 bytes padding
+  bool disconnect_seen_{false};
+  bool gap_disconnect_requested_{false};
+  bool disconnect_recovery_failed_{false};
 
   void log_event_(const char *name);
   void log_gattc_lifecycle_event_(const char *name);
@@ -140,6 +142,7 @@ class BLEClientBase : public espbt::ESPBTClient, public Component {
   void log_gattc_warning_(const char *operation, esp_err_t err);
   void log_connection_params_(const char *param_type);
   void handle_connection_result_(esp_err_t ret);
+  bool recover_disconnect_();
   /// Hook called once a connection has been fully torn down (after release_services() and
   /// set_idle_()), from both the CLOSE_EVT handler and the DISCONNECTING safety timeout.
   /// Subclasses with extra per-connection accounting (e.g. bluetooth_proxy slot state)
@@ -150,6 +153,9 @@ class BLEClientBase : public espbt::ESPBTClient, public Component {
   void set_idle_() {
     this->set_state(espbt::ClientState::IDLE);
     this->conn_id_ = UNSET_CONN_ID;
+    this->disconnect_seen_ = false;
+    this->gap_disconnect_requested_ = false;
+    this->disconnect_recovery_failed_ = false;
   }
   /// Transition to DISCONNECTING and start the safety timeout.
   void set_disconnecting_() {
